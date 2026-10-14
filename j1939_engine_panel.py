@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
 J1939 Engine Panel v2  -  Copperhill jCOM.J1939.USB  ->  Cummins CM850 / CM2850
 Dark digital dashboard + TSC1 throttle.  Pick port "DEMO" to try it without hardware.

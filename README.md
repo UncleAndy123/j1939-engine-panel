@@ -85,3 +85,8 @@ If the ECM ignores TSC1, try another source address (for example 39 / 0x27, 17 /
 - **J1939 data:** decoded per SAE J1939-71.
   - Parameter groups: EEC1/2, ET1/2, EFL/P1, LFE, IC1, VEP1, HOURS, LFC, WFI.
   - Fault codes: DM1 (J1939-73).
+
+## License
+
+[GNU General Public License v3.0 or later](LICENSE). You may use, modify and redistribute this software, but any
+distributed modified version must also be released under the GPL with its source code.
