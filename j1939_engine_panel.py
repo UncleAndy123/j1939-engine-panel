@@ -838,7 +838,8 @@ class App(tk.Tk):
         ctl = tk.Frame(hdr, bg=BG)
         ctl.pack(side="right")
         self._lbl(ctl, "PORT", bg=BG).pack(side="left", padx=(0, px(4)))
-        self.port = ttk.Combobox(ctl, width=10, values=self.ports(), font=(F["ui"], 10))
+        self.port = ttk.Combobox(ctl, width=32, values=self.ports(), font=(F["ui"], 10),
+                                 style="Port.TCombobox", postcommand=lambda: self._widen_dropdown(self.port))
         self.port.pack(side="left")
         if self.port["values"]:
             self.port.current(0)
@@ -976,6 +977,18 @@ class App(tk.Tk):
         body.rowconfigure(2, weight=1)
 
     # ------------------------------------------------------------ helpers
+    @staticmethod
+    def _widen_dropdown(cb):
+        """Make the combobox's drop-down list as wide as its longest entry."""
+        vals = cb.cget("values") or ()
+        if not vals:
+            return
+        f = tkfont.Font(font=cb.cget("font"))
+        need = max(f.measure(str(v)) for v in vals) + px(34)       # text + scrollbar/padding
+        extra = max(0, need - cb.winfo_width())
+        # postoffset = (dx, dy, dwidth, dheight): grow the list leftward so it stays on screen
+        ttk.Style(cb).configure(cb.cget("style") or "TCombobox", postoffset=(-extra, 0, extra, 0))
+
     def ports(self):
         real = [p.device for p in serial.tools.list_ports.comports()] if serial else []
         self.rp_map = {}
