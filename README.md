@@ -79,6 +79,14 @@ If the ECM ignores TSC1, try another source address (for example 39 / 0x27, 17 /
   - on overspeed (max RPM + 300).
 - ARM is refused unless the engine is running (above 400 rpm).
 - Test on a bench or with the machine in neutral and parked. Keep max RPM conservative.
+## Tested/Supported Models
+If anyone tests another model of engine, please open a Github issue, and I will update status here.
+
+Currently tested on:
+  - Cummins 8.3 CM2850 CP3 Fuel Pump
+  - Cummins 8.9 
+
+**In theory this should work on any engine that communicates over J1939 CAN bus, but use caution when trying. I assume no responsibility for any issues and mechanical or bodily harm caused by using this software.**
 
 ## Troubleshooting
 
