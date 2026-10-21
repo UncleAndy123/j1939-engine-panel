@@ -11,7 +11,7 @@ Single Python file, Tkinter UI. `pyserial` is the only dependency (needed only f
 > Use the diagnostic adapter you already have. The app now works with **RP1210 adapters**, the
 > same driver standard Cummins INSITE uses, including the **Cummins INLINE 8**. Installed adapters are found
 > automatically and appear in the **PORT** menu (for example `RP1210 · INLINE8, USB`), so you don't need a
-> separate gateway. Tested with the INLINE 8 on a CM850 bench engine. See [Requirements](#requirements) for the
+> separate gateway. The live dashboard has been tested with the INLINE 8 on a CM850 bench engine. See [Requirements](#requirements) for the
 > 32-bit Python note.
 
 ![Screenshot](docs/screenshot.png)
