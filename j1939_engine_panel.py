@@ -215,6 +215,237 @@ def tsc1(rpm=None):
 NAME = bytes([0x39, 0x19, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])  # LSB first, non-arbitrary
 
 
+# =============================================================== RP1210 adapters (Cummins INLINE, Nexiq, etc.)
+import configparser, ctypes, os, re, struct
+
+# RP1210 command numbers
+RP_SET_ALL_FILTERS_PASS = 3
+RP_PROTECT_J1939_ADDRESS = 19
+
+
+def rp1210_devices(windir=None):
+    """Read RP121032.ini and each vendor .ini; return {label: (dll_name, device_id)}."""
+    windir = windir or os.environ.get("WINDIR", r"C:\Windows")
+    out = {}
+
+    def read_ini(path):
+        cp = configparser.ConfigParser(strict=False, interpolation=None, inline_comment_prefixes=(";",))
+        cp.optionxform = str
+        try:
+            with open(path, encoding="latin-1") as f:
+                cp.read_file(f)
+            return cp
+        except (OSError, configparser.Error):
+            return None                                 # unreadable or malformed vendor ini -> skip it
+
+    main = read_ini(os.path.join(windir, "RP121032.ini"))
+    if not main or not main.has_option("RP1210Support", "APIImplementations"):
+        return out
+    for impl in [s.strip() for s in main.get("RP1210Support", "APIImplementations").split(",") if s.strip()]:
+        cp = read_ini(os.path.join(windir, impl + ".ini"))
+        if not cp:
+            continue
+        vendor = cp.get("VendorInformation", "Name", fallback=impl).strip()
+        if "mock" in vendor.lower() or "nemesis" in vendor.lower():
+            continue                                    # skip simulator driver
+        for sec in cp.sections():
+            if not sec.startswith("DeviceInformation"):
+                continue
+            try:
+                dev = int(cp.get(sec, "DeviceID"))
+            except (ValueError, configparser.Error):
+                continue
+            desc = cp.get(sec, "DeviceDescription", fallback=sec).strip()
+            if re.search(r",\s*COM\d+$", desc):          # drop legacy numbered serial ports (keep USB / Auto Detect)
+                continue
+            out[f"RP1210 · {desc} [{impl}:{dev}]"] = (impl, dev)
+    return out
+
+
+def _load_rp1210_dll(name):
+    windir = os.environ.get("WINDIR", r"C:\Windows")
+    for p in (os.path.join(windir, name + ".dll"),
+              os.path.join(windir, "SysWOW64", name + ".dll"),
+              os.path.join(windir, "System32", name + ".dll"),
+              name):
+        try:
+            return ctypes.WinDLL(p)
+        except OSError as e:
+            last = e
+    bits = struct.calcsize("P") * 8
+    hint = "  This driver is 32-bit — run the app with 32-bit Python." if bits == 64 else ""
+    raise OSError(f"Could not load {name}.dll: {last}.{hint}")
+
+
+class RP1210Gateway:
+    """Drives an RP1210 adapter (Cummins INLINE, Nexiq, etc.) but presents the same
+    message interface as Gateway/DemoGateway, so the rest of the app is unchanged.
+
+    RP1210 has no 'periodic transmit' feature, so TSC1 is repeated from a thread here.
+    The GUI must call kick() regularly; if it stops for >0.5 s the periodic TSC1 stops,
+    so a frozen or crashed UI releases the throttle instead of holding the last speed.
+    """
+
+    def __init__(self, dll_name, device_id, kbps, q):
+        self.q, self.alive, self.lock = q, True, threading.Lock()
+        self.sa = None
+        self.periodic = {}                               # pgn -> (interval_s, next_t, da, sa, prio, data)
+        self.last_kick = time.time()
+        self.dll = _load_rp1210_dll(dll_name)
+        d = self.dll
+        d.RP1210_ClientConnect.restype = ctypes.c_short
+        d.RP1210_ClientConnect.argtypes = [ctypes.c_void_p, ctypes.c_short, ctypes.c_char_p,
+                                           ctypes.c_long, ctypes.c_long, ctypes.c_short]
+        for fn, res, args in (
+            ("RP1210_ClientDisconnect", ctypes.c_short, [ctypes.c_short]),
+            ("RP1210_SendMessage", ctypes.c_short,
+             [ctypes.c_short, ctypes.c_char_p, ctypes.c_short, ctypes.c_short, ctypes.c_short]),
+            ("RP1210_ReadMessage", ctypes.c_short,
+             [ctypes.c_short, ctypes.c_char_p, ctypes.c_short, ctypes.c_short]),
+            ("RP1210_SendCommand", ctypes.c_short,
+             [ctypes.c_short, ctypes.c_short, ctypes.c_char_p, ctypes.c_short]),
+            ("RP1210_GetErrorMsg", ctypes.c_short, [ctypes.c_short, ctypes.c_char_p]),
+        ):
+            try:
+                getattr(d, fn).restype = res
+                getattr(d, fn).argtypes = args
+            except AttributeError:
+                pass
+
+        self.name = f"{dll_name}:{device_id}"
+        cid = d.RP1210_ClientConnect(None, device_id, f"J1939:Baud={kbps}".encode(), 0, 0, 0)
+        if cid < 0 or cid > 127:                         # 0..127 = client id, else error code
+            raise OSError(f"ClientConnect failed: {self._err(cid)}")
+        self.cid = cid
+
+        self._winmm = None
+        try:
+            self._winmm = ctypes.WinDLL("winmm")
+            self._winmm.timeBeginPeriod(1)               # 1 ms timer resolution for the 10 ms TSC1 loop
+        except Exception:
+            self._winmm = None
+
+        self._log(f"RP1210 {self.name} connected (client {cid}, J1939 @ {kbps}k)")
+        self._put([VERSION, 2, 0, 0, 2, 1, 0])           # synthetic version so the UI shows a gateway
+        threading.Thread(target=self._reader, daemon=True).start()
+        threading.Thread(target=self._periodic_tx, daemon=True).start()
+        threading.Thread(target=self._heartbeat, daemon=True).start()
+
+    # ---- helpers
+    def _err(self, code):
+        buf = ctypes.create_string_buffer(256)
+        try:
+            self.dll.RP1210_GetErrorMsg(abs(int(code)), buf)
+            txt = buf.value.decode(errors="ignore").strip()
+        except Exception:
+            txt = ""
+        return f"error {abs(int(code))}" + (f" ({txt})" if txt else "")
+
+    def _put(self, payload):
+        self.q.put(("msg", bytes(payload), time.time()))
+
+    def _log(self, s):
+        self.q.put(("log", s, time.time()))
+
+    # ---- control messages from the app (same bytes the jCOM gateway would get)
+    def send(self, payload):
+        mid = payload[0]
+        if mid == REQINFO and len(payload) >= 2:
+            if payload[1] == VERSION:
+                self._put([VERSION, 2, 0, 0, 2, 1, 0])
+            elif payload[1] == REPSTATUS:
+                self._put([REPSTATUS, 2 if self.sa is not None else 4,
+                           self.sa if self.sa is not None else 254])
+        # SETACK and anything else: nothing to do (RP1210 has no equivalent)
+
+    def reset(self, kbps=250):
+        pass                                             # baud is fixed at ClientConnect
+
+    def add_filter(self, pgn):
+        with self.lock:
+            self.dll.RP1210_SendCommand(RP_SET_ALL_FILTERS_PASS, self.cid, b"", 0)
+
+    def claim(self, name8, sa):
+        data = bytes(name8[:8]).ljust(8, b"\x00") + bytes([sa, 0])   # NAME, address, block-until-done
+        with self.lock:
+            r = self.dll.RP1210_SendCommand(RP_PROTECT_J1939_ADDRESS, self.cid, data, len(data))
+        if r == 0:
+            self.sa = sa
+            self._put([REPSTATUS, 2, sa])
+        else:
+            self._log(f"RP1210 address claim failed: {self._err(r)}")
+            self._put([REPSTATUS, 3, 254])
+
+    def tx(self, pgn, da, sa, prio, data):
+        # RP1210 J1939 send block: PGN(3 LE), priority, source, dest, data
+        msg = bytes([pgn & 0xFF, (pgn >> 8) & 0xFF, (pgn >> 16) & 0xFF, prio & 7, sa & 0xFF, da & 0xFF]) + bytes(data)
+        with self.lock:
+            r = self.dll.RP1210_SendMessage(self.cid, msg, len(msg), 0, 1)
+        if r != 0:
+            self._log(f"RP1210 send PGN 0x{pgn:05X} failed: {self._err(r)}")
+
+    def tx_periodic(self, pgn, da, sa, prio, ms, data):
+        if ms == 0:
+            self.periodic.pop(pgn, None)
+        else:
+            self.periodic[pgn] = [ms / 1000.0, 0.0, da, sa, prio, bytes(data)]
+
+    def request(self, pgn, da, sa):
+        self.tx(PGN_REQ, da, sa, 6, [pgn & 0xFF, (pgn >> 8) & 0xFF, (pgn >> 16) & 0xFF])
+
+    def kick(self):
+        self.last_kick = time.time()
+
+    # ---- threads
+    def _reader(self):
+        buf = ctypes.create_string_buffer(2048)
+        while self.alive:
+            with self.lock:
+                try:
+                    n = self.dll.RP1210_ReadMessage(self.cid, buf, len(buf), 0)
+                except Exception as e:
+                    if self.alive:
+                        self.q.put(("err", str(e), time.time()))
+                    return
+            if n and 0 < n <= len(buf):
+                raw = buf.raw[:n]
+                if n >= 10:                              # timestamp(4) + PGN(3) + how(1) + src(1) + dst(1)
+                    pgn = raw[4] | (raw[5] << 8) | (raw[6] << 16)
+                    src, dst, pdata = raw[8], raw[9], raw[10:]
+                    self._put(bytes([RXDATA, (pgn >> 16) & 0xFF, (pgn >> 8) & 0xFF, pgn & 0xFF,
+                                     dst, src, raw[7] & 7]) + pdata)
+            else:
+                time.sleep(0.001)
+
+    def _periodic_tx(self):
+        while self.alive:
+            now = time.time()
+            if now - self.last_kick < 0.5:               # fail-safe: GUI must keep kicking
+                for pgn, p in list(self.periodic.items()):
+                    if now >= p[1]:
+                        p[1] = now + p[0]
+                        self.tx(pgn, p[2], p[3], p[4], p[5])
+            time.sleep(0.002)
+
+    def _heartbeat(self):
+        while self.alive:
+            self._put([HEART, 2, 0, 0, 2, 1, 0, 0, 0])
+            time.sleep(1.0)
+
+    def close(self):
+        self.alive = False
+        self.periodic.clear()
+        try:
+            self.dll.RP1210_ClientDisconnect(self.cid)
+        except Exception:
+            pass
+        if self._winmm:
+            try:
+                self._winmm.timeEndPeriod(1)
+            except Exception:
+                pass
+
+
 # =============================================================== demo engine
 class DemoGateway(GatewayBase):
     """Simulated gateway + engine so the UI can be tested without hardware."""
@@ -745,10 +976,15 @@ class App(tk.Tk):
         body.rowconfigure(2, weight=1)
 
     # ------------------------------------------------------------ helpers
-    @staticmethod
-    def ports():
+    def ports(self):
         real = [p.device for p in serial.tools.list_ports.comports()] if serial else []
-        return real + ["DEMO"]
+        self.rp_map = {}
+        if os.name == "nt":
+            try:
+                self.rp_map = rp1210_devices()
+            except Exception:
+                self.rp_map = {}
+        return real + list(self.rp_map) + ["DEMO"]
 
     def logmsg(self, s):
         self.log.insert("end", time.strftime("%H:%M:%S  ") + s + "\n")
@@ -799,12 +1035,15 @@ class App(tk.Tk):
         try:
             if port == "DEMO":
                 self.gw = DemoGateway(self.q)
+            elif port in getattr(self, "rp_map", {}):
+                dll, dev = self.rp_map[port]
+                self.gw = RP1210Gateway(dll, dev, int(self.can.get()), self.q)
             elif serial is None:
                 return messagebox.showerror("Serial", "pyserial not installed:  pip install pyserial")
             else:
                 self.gw = Gateway(port, int(self.baud.get()), self.q)
         except Exception as e:
-            return messagebox.showerror("Serial", str(e))
+            return messagebox.showerror("Connect", str(e))
         self.claimed, self.sa = False, None
         self.vals, self.stamp, self.dm1 = {}, {}, {}
         self.rx_count, self.ack_count, self.seen, self.heart_errs = 0, 0, set(), None
@@ -933,9 +1172,12 @@ class App(tk.Tk):
             while True:
                 kind, m, t = self.q.get_nowait()
                 if kind == "err":
-                    self.logmsg("Serial error: " + m)
+                    self.logmsg("Adapter error: " + m)
                     self.disconnect()
                     return
+                if kind == "log":
+                    self.logmsg(m)
+                    continue
                 self.handle(m, t)
         except queue.Empty:
             pass
@@ -992,6 +1234,8 @@ class App(tk.Tk):
     def refresh(self):
         self.drain()
         now = time.time()
+        if self.gw is not None and hasattr(self.gw, "kick"):
+            self.gw.kick()                               # fail-safe heartbeat to the RP1210 TSC1 loop
 
         def val(k, age=2.5):
             return self.vals.get(k) if now - self.stamp.get(k, 0) < age else None
@@ -1027,9 +1271,13 @@ class App(tk.Tk):
             self.rate, self.rate_n, self.rate_t = self.rate_n / (now - self.rate_t), 0, now
         if self.gw:
             hb = now - self.last_heart < 3
-            demo = isinstance(self.gw, DemoGateway)
-            self.p_gw.config(text=f"● GATEWAY  {'DEMO' if demo else ('OK' if hb else 'NO HEARTBEAT')}",
-                             fg=OK if hb else WARN)
+            if isinstance(self.gw, DemoGateway):
+                kind = "DEMO"
+            elif isinstance(self.gw, RP1210Gateway):
+                kind = "RP1210" if hb else "RP1210 (no data)"
+            else:
+                kind = "OK" if hb else "NO HEARTBEAT"
+            self.p_gw.config(text=f"● GATEWAY  {kind}", fg=OK if hb else WARN)
             self.p_bus.config(text=f"● BUS  {self.rate:.0f} msg/s", fg=OK if self.rate > 0 else WARN)
             self.p_mode.config(text=f"● {'SA ' + str(self.sa) if self.claimed else 'LISTEN-ONLY'}",
                                fg=ACCENT if self.claimed else MUTED)

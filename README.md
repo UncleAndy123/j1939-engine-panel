@@ -1,10 +1,11 @@
 # J1939 Engine Panel
 
-Dark, digital-gauge dashboard and TSC1 throttle control for Cummins engines over SAE J1939, using the
+Dark, digital-gauge dashboard and TSC1 throttle control for Cummins engines over SAE J1939. Works with the
 [Copperhill jCOM.J1939.USB gateway](https://copperhilltech.com/sae-j1939-starter-kit-and-network-simulator/)
-(SAE J1939 Starter Kit). Built and tested against a **Cummins QSC8.3 / CM850 (CM2850)** on a test bench.
+(SAE J1939 Starter Kit) **or any RP1210 adapter** (Cummins INLINE 6/7/8, Nexiq USB-Link, etc. — the same adapters
+INSITE uses). Built and tested against a **Cummins QSC8.3 / CM850 (CM2850)** on a test bench.
 
-Single Python file, Tkinter UI. The only dependency is `pyserial`.
+Single Python file, Tkinter UI. `pyserial` is the only dependency (needed only for the jCOM gateway).
 
 ![Screenshot](docs/screenshot.png)
 
@@ -24,14 +25,17 @@ Single Python file, Tkinter UI. The only dependency is `pyserial`.
   - Every new PGN and source address seen on the bus.
   - Gateway version, heartbeat and serial error counters.
   - A 5-second bus health report after connecting.
+- **Two adapter backends**
+  - **jCOM.J1939.USB** serial gateway — cross-platform.
+  - **RP1210** — Cummins INLINE 6/7/8, Nexiq, and other RP1210 adapters (Windows only). Detected automatically from the installed drivers and listed in the port menu.
 - **DEMO mode**: a simulated gateway and engine, so the UI can be tried without hardware.
 
 ## Requirements
 
 - Python 3.9+ with Tkinter (included in the standard Windows installer)
-- `pyserial`
-- Copperhill jCOM.J1939.USB board.
-  - USB chip: SiLabs CP2102. Windows 10 installs the driver automatically; on Windows 11, get it from [silabs.com](https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers).
+- `pyserial` (for the jCOM gateway)
+- **For the jCOM gateway:** Copperhill jCOM.J1939.USB board. USB chip is a SiLabs CP2102 — Windows 10 installs the driver automatically; on Windows 11, get it from [silabs.com](https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers).
+- **For an RP1210 adapter:** the adapter's driver installed (e.g. Cummins INLINE 8 drivers — the same ones INSITE uses). The RP1210 driver DLLs are 32-bit, so **run the app with 32-bit Python** on Windows. Close INSITE first; two programs can't share one adapter.
 
 ## Install & run
 
@@ -48,8 +52,8 @@ pip install -r requirements.txt --trusted-host pypi.org --trusted-host files.pyt
 
 ## Usage
 
-1. Select the jCOM COM port (or **DEMO**). Baud **115200**, CAN **250** kbps (CM850/CM2850).
-2. Click **CONNECT**. The gateway starts in listen-only mode and the dashboard fills in.
+1. Pick the adapter in the **PORT** menu: a jCOM COM port, an `RP1210 · …` entry (e.g. `RP1210 · INLINE8, USB`), or **DEMO**. Set CAN **250** kbps (CM850/CM2850). Baud **115200** applies to the jCOM gateway only.
+2. Click **CONNECT**. The adapter starts in listen-only mode and the dashboard fills in.
 3. **Throttle:** with the engine running, set **My SA** (default `3`), **Engine SA** (`0`) and min/max RPM, then **ARM**.
    - The app claims the address and the gateway sends TSC1 every 10 ms.
    - Move the slider and watch the response line and the torque mode.
@@ -59,8 +63,9 @@ If the ECM ignores TSC1, try another source address (for example 39 / 0x27, 17 /
 
 ## ⚠️ Safety
 
-- **While ARMED, the gateway repeats TSC1 on its own.** If the PC or app crashes, the engine **holds the last requested speed**.
-- Kill switch: **STOP / Esc / Space**, **unplug the jCOM USB** (the board is USB powered), or **key off**.
+- **jCOM gateway:** while ARMED the gateway repeats TSC1 on its own. If the PC or app crashes, the engine **holds the last requested speed** until you cut it off.
+- **RP1210 adapter:** the app itself repeats TSC1 and must be "kicked" by the running UI. If the app freezes or crashes, TSC1 stops within ~0.5 s and the ECM releases the override after its timeout — a safer failure mode than the jCOM.
+- Kill switch either way: **STOP / Esc / Space**, **unplug the adapter**, or **key off**.
 - Built-in watchdogs drop the override:
   - if RPM data is lost for 1.5 s;
   - on overspeed (max RPM + 300).
@@ -78,10 +83,9 @@ If the ECM ignores TSC1, try another source address (for example 39 / 0x27, 17 /
 
 ## How it works
 
-- **Gateway link:** talks to the jCOM gateway over its documented serial protocol
-  ([PDF](https://copperhilltech.com/content/jCOM1939-Protocol.pdf)).
-  - Frames are byte-stuffed, start with `0xC0`, and carry a 2's-complement checksum.
-  - Commands used: RESET, ADDFILTER, SETPARAM1 (address claim), TXDATA / TXDATAP (periodic transmit), REQINFO.
+- **Adapter backends:** both present the same internal message interface, so the dashboard, faults and throttle logic are shared.
+  - **jCOM:** the documented serial protocol ([PDF](https://copperhilltech.com/content/jCOM1939-Protocol.pdf)) — byte-stuffed frames starting with `0xC0` and a 2's-complement checksum. Commands used: RESET, ADDFILTER, SETPARAM1 (address claim), TXDATA / TXDATAP (periodic transmit), REQINFO.
+  - **RP1210:** the standard `RP1210_*` C API via `ctypes`. Adapters are discovered from `RP121032.ini` and each vendor `.ini`. Connects with `J1939:Baud=…`, passes all filters, claims the address with the Protect-J1939-Address command, and sends/reads J1939 messages. TSC1 is repeated from a worker thread gated by a UI heartbeat.
 - **J1939 data:** decoded per SAE J1939-71.
   - Parameter groups: EEC1/2, ET1/2, EFL/P1, LFE, IC1, VEP1, HOURS, LFC, WFI.
   - Fault codes: DM1 (J1939-73).
