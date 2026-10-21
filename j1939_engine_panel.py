@@ -289,8 +289,10 @@ class RP1210Gateway:
     def __init__(self, dll_name, device_id, kbps, q):
         self.q, self.alive, self.lock = q, True, threading.Lock()
         self.sa = None
-        self.periodic = {}                               # pgn -> (interval_s, next_t, da, sa, prio, data)
+        self.periodic = {}                               # pgn -> [interval_s, next_t, da, sa, prio, data]
         self.last_kick = time.time()
+        self.link_ok = True                              # False while ReadMessage is returning errors
+        self._last_log = {}                              # message -> time, to rate-limit repeated errors
         self.dll = _load_rp1210_dll(dll_name)
         d = self.dll
         d.RP1210_ClientConnect.restype = ctypes.c_short
@@ -326,7 +328,6 @@ class RP1210Gateway:
             self._winmm = None
 
         self._log(f"RP1210 {self.name} connected (client {cid}, J1939 @ {kbps}k)")
-        self._put([VERSION, 2, 0, 0, 2, 1, 0])           # synthetic version so the UI shows a gateway
         threading.Thread(target=self._reader, daemon=True).start()
         threading.Thread(target=self._periodic_tx, daemon=True).start()
         threading.Thread(target=self._heartbeat, daemon=True).start()
@@ -344,15 +345,29 @@ class RP1210Gateway:
     def _put(self, payload):
         self.q.put(("msg", bytes(payload), time.time()))
 
-    def _log(self, s):
-        self.q.put(("log", s, time.time()))
+    def _log(self, s, every=0.0):
+        now = time.time()
+        if every and now - self._last_log.get(s, 0) < every:
+            return
+        self._last_log[s] = now
+        self.q.put(("log", s, now))
+
+    def _driver_version(self):
+        try:
+            bufs = [ctypes.create_string_buffer(32) for _ in range(4)]
+            with self.lock:
+                self.dll.RP1210_ReadVersion(*bufs)
+            v = [b.value.decode(errors="ignore").strip() for b in bufs]
+            return f"DLL {v[0]}.{v[1]}, RP1210 API {v[2]}.{v[3]}"
+        except Exception:
+            return "version unavailable"
 
     # ---- control messages from the app (same bytes the jCOM gateway would get)
     def send(self, payload):
         mid = payload[0]
         if mid == REQINFO and len(payload) >= 2:
             if payload[1] == VERSION:
-                self._put([VERSION, 2, 0, 0, 2, 1, 0])
+                self._log(f"RP1210 driver {self.name}: {self._driver_version()}")
             elif payload[1] == REPSTATUS:
                 self._put([REPSTATUS, 2 if self.sa is not None else 4,
                            self.sa if self.sa is not None else 254])
@@ -366,23 +381,32 @@ class RP1210Gateway:
             self.dll.RP1210_SendCommand(RP_SET_ALL_FILTERS_PASS, self.cid, b"", 0)
 
     def claim(self, name8, sa):
-        data = bytes(name8[:8]).ljust(8, b"\x00") + bytes([sa, 0])   # NAME, address, block-until-done
-        with self.lock:
-            r = self.dll.RP1210_SendCommand(RP_PROTECT_J1939_ADDRESS, self.cid, data, len(data))
-        if r == 0:
-            self.sa = sa
-            self._put([REPSTATUS, 2, sa])
-        else:
-            self._log(f"RP1210 address claim failed: {self._err(r)}")
-            self._put([REPSTATUS, 3, 254])
+        # Protect_J1939_Address block: address(1), NAME(8, LSB first), 0 = block until claim done.
+        # The claim takes a few hundred ms, so run it off the UI thread; the result comes back as REPSTATUS.
+        data = bytes([sa & 0xFF]) + bytes(name8[:8]).ljust(8, b"\x00") + bytes([0])
+
+        def work():
+            with self.lock:
+                if not self.alive:
+                    return
+                r = self.dll.RP1210_SendCommand(RP_PROTECT_J1939_ADDRESS, self.cid, data, len(data))
+            if r == 0:
+                self.sa = sa
+                self._put([REPSTATUS, 2, sa])
+            else:
+                self._log(f"RP1210 address claim failed: {self._err(r)}")
+                self._put([REPSTATUS, 3, 254])
+        threading.Thread(target=work, daemon=True).start()
 
     def tx(self, pgn, da, sa, prio, data):
-        # RP1210 J1939 send block: PGN(3 LE), priority, source, dest, data
+        # RP1210 J1939 send block: PGN(3 LE), how/priority, source, dest, data
         msg = bytes([pgn & 0xFF, (pgn >> 8) & 0xFF, (pgn >> 16) & 0xFF, prio & 7, sa & 0xFF, da & 0xFF]) + bytes(data)
         with self.lock:
+            if not self.alive:
+                return
             r = self.dll.RP1210_SendMessage(self.cid, msg, len(msg), 0, 1)
         if r != 0:
-            self._log(f"RP1210 send PGN 0x{pgn:05X} failed: {self._err(r)}")
+            self._log(f"RP1210 send PGN 0x{pgn:05X} failed: {self._err(r)}", every=2.0)
 
     def tx_periodic(self, pgn, da, sa, prio, ms, data):
         if ms == 0:
@@ -401,44 +425,56 @@ class RP1210Gateway:
         buf = ctypes.create_string_buffer(2048)
         while self.alive:
             with self.lock:
+                if not self.alive:
+                    return
                 try:
                     n = self.dll.RP1210_ReadMessage(self.cid, buf, len(buf), 0)
                 except Exception as e:
-                    if self.alive:
-                        self.q.put(("err", str(e), time.time()))
+                    self.q.put(("err", str(e), time.time()))
                     return
-            if n and 0 < n <= len(buf):
-                raw = buf.raw[:n]
+            if 0 < n <= len(buf):
+                self.link_ok = True
                 if n >= 10:                              # timestamp(4) + PGN(3) + how(1) + src(1) + dst(1)
+                    raw = buf.raw[:n]
                     pgn = raw[4] | (raw[5] << 8) | (raw[6] << 16)
                     src, dst, pdata = raw[8], raw[9], raw[10:]
                     self._put(bytes([RXDATA, (pgn >> 16) & 0xFF, (pgn >> 8) & 0xFF, pgn & 0xFF,
                                      dst, src, raw[7] & 7]) + pdata)
+            elif n < 0:                                  # driver error (e.g. adapter unplugged)
+                self.link_ok = False
+                self._log(f"RP1210 read error: {self._err(n)}", every=5.0)
+                time.sleep(0.05)
             else:
-                time.sleep(0.001)
+                time.sleep(0.001)                        # 0 = no message waiting
 
     def _periodic_tx(self):
         while self.alive:
             now = time.time()
-            if now - self.last_kick < 0.5:               # fail-safe: GUI must keep kicking
-                for pgn, p in list(self.periodic.items()):
-                    if now >= p[1]:
-                        p[1] = now + p[0]
-                        self.tx(pgn, p[2], p[3], p[4], p[5])
+            if self.periodic and now - self.last_kick >= 0.5:
+                # Fail-safe: the UI stopped responding. Drop the override and latch it off;
+                # the app must be re-armed, so the engine never jumps back on its own.
+                self.periodic.clear()
+                self.q.put(("disarm", "UI stalled - TSC1 released by fail-safe", now))
+            for pgn, p in list(self.periodic.items()):
+                if now >= p[1]:
+                    p[1] = now + p[0]
+                    self.tx(pgn, p[2], p[3], p[4], p[5])
             time.sleep(0.002)
 
     def _heartbeat(self):
         while self.alive:
-            self._put([HEART, 2, 0, 0, 2, 1, 0, 0, 0])
+            if self.link_ok:
+                self._put([HEART])                       # adapter alive; no jCOM-style version fields
             time.sleep(1.0)
 
     def close(self):
-        self.alive = False
         self.periodic.clear()
-        try:
-            self.dll.RP1210_ClientDisconnect(self.cid)
-        except Exception:
-            pass
+        with self.lock:                                  # wait for any in-flight driver call
+            self.alive = False
+            try:
+                self.dll.RP1210_ClientDisconnect(self.cid)
+            except Exception:
+                pass
         if self._winmm:
             try:
                 self._winmm.timeEndPeriod(1)
@@ -1190,6 +1226,10 @@ class App(tk.Tk):
                     return
                 if kind == "log":
                     self.logmsg(m)
+                    continue
+                if kind == "disarm":
+                    if self.armed or self.pending_arm:
+                        self.stop(m)
                     continue
                 self.handle(m, t)
         except queue.Empty:

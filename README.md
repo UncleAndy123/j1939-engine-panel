@@ -7,6 +7,13 @@ INSITE uses). Built and tested against a **Cummins QSC8.3 / CM850 (CM2850)** on 
 
 Single Python file, Tkinter UI. `pyserial` is the only dependency (needed only for the jCOM gateway).
 
+> ### 🆕 RP1210 adapter support
+> Use the diagnostic adapter you already have. The app now works with **RP1210 adapters**, the
+> same driver standard Cummins INSITE uses, including the **Cummins INLINE 8**. Installed adapters are found
+> automatically and appear in the **PORT** menu (for example `RP1210 · INLINE8, USB`), so you don't need a
+> separate gateway. Tested with the INLINE 8 on a CM850 bench engine. See [Requirements](#requirements) for the
+> 32-bit Python note.
+
 ![Screenshot](docs/screenshot.png)
 
 ## Features
@@ -64,7 +71,8 @@ If the ECM ignores TSC1, try another source address (for example 39 / 0x27, 17 /
 ## ⚠️ Safety
 
 - **jCOM gateway:** while ARMED the gateway repeats TSC1 on its own. If the PC or app crashes, the engine **holds the last requested speed** until you cut it off.
-- **RP1210 adapter:** the app itself repeats TSC1 and must be "kicked" by the running UI. If the app freezes or crashes, TSC1 stops within ~0.5 s and the ECM releases the override after its timeout — a safer failure mode than the jCOM.
+- **RP1210 adapter:** the app itself repeats TSC1, gated by a heartbeat from the running UI. If the app freezes or crashes, TSC1 stops within ~0.5 s and the ECM releases the override after its timeout, which is a safer failure mode than the jCOM. The fail-safe **latches off**: the throttle won't come back on its own, so you must ARM again.
+  - On Windows, dragging or resizing the window pauses the UI, so it trips this fail-safe. Don't move the window while armed.
 - Kill switch either way: **STOP / Esc / Space**, **unplug the adapter**, or **key off**.
 - Built-in watchdogs drop the override:
   - if RPM data is lost for 1.5 s;
@@ -80,6 +88,9 @@ If the ECM ignores TSC1, try another source address (for example 39 / 0x27, 17 /
 | No gateway ACKs | Old ACK setting stored in the gateway. Connect now forces ACKs back on |
 | Wrong CAN speed | CM850/CM2850 = 250 kbps. Some newer engines use 500 kbps |
 | ECM ignores TSC1 | TSC1 not allowed from that source address in the calibration. Try other SAs |
+| RP1210: `Could not load ….dll` | Driver DLLs are 32-bit. Run the app with 32-bit Python |
+| RP1210: connect fails or `GATEWAY RP1210 (no data)` | Close INSITE or any other program using the adapter. Check the adapter is plugged in and the driver is installed |
+| RP1210 adapter missing from the PORT menu | Install its driver, then click ⟳. Adapters are read from `C:\Windows\RP121032.ini` |
 
 ## How it works
 
