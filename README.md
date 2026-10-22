@@ -119,8 +119,9 @@ Currently tested on:
 ## Releasing a new version
 
 1. Bump `__version__` in `j1939_engine_panel.py` (for example `1.0.1`).
-2. Write the release notes in `CHANGELOG-latest.md`.
-3. Commit and push to `main`.
+2. In [`CHANGELOG.md`](CHANGELOG.md), rename `[Unreleased]` to the new version and date, add a fresh empty `[Unreleased]` section, and update the compare links at the bottom.
+3. Copy that version's entries into `CHANGELOG-latest.md` (it becomes the GitHub release text) and replace `vNEXT` with the version.
+4. Commit and push to `main`.
 
 That's it. GitHub Actions ([`release.yml`](.github/workflows/release.yml)) sees the new version, builds the exe with 32-bit Python and PyInstaller, creates the `v1.0.1` tag, and publishes the release with the exe attached. Pushes that don't change the version don't publish anything. You can also push a `vX.Y.Z` tag yourself; it must match `__version__`.
 
