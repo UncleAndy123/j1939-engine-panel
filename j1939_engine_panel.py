@@ -14,7 +14,7 @@ unplug the adapter, or key off.
 import json, math, queue, random, sys, threading, time, tkinter as tk, urllib.request, webbrowser
 from tkinter import ttk, messagebox, font as tkfont
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 APP_NAME = "J1939 Engine Panel"
 GITHUB_REPO = "UncleAndy123/j1939-engine-panel"
 
