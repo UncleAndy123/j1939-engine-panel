@@ -1,9 +1,9 @@
-# J1939 Engine Panel
+# J1939 Engine Gauge Panel With TSC1 Throttle Controls
+## Dashboard for J1939 based engines, connected via standard 9-pin diagnostics port and cable. 
 
 Dark, digital-gauge dashboard and TSC1 throttle control for Cummins engines over SAE J1939. Works with the
 [Copperhill jCOM.J1939.USB gateway](https://copperhilltech.com/sae-j1939-starter-kit-and-network-simulator/)
-(SAE J1939 Starter Kit) **or any RP1210 adapter** (Cummins INLINE 6/7/8, Nexiq USB-Link, etc. — the same adapters
-INSITE uses). Built and tested against a **Cummins QSC8.3 / CM850 (CM2850)** on a test bench.
+(SAE J1939 Starter Kit) **or any RP1210 adapter** (Cummins INLINE 6/7/8, Nexiq USB-Link, etc.). Built and tested against a **Cummins QSC8.3 / CM850 (CM2850)** on a test bench.
 
 Single Python file, Tkinter UI. `pyserial` is the only dependency (needed only for the jCOM gateway).
 
