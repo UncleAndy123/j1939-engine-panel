@@ -1,5 +1,5 @@
 # J1939 Engine Gauge Panel With TSC1 Throttle Controls
-## Dashboard for J1939 based engines, connected via standard 9-pin diagnostics port and cable. 
+## Control Dashboard for J1939 based Engines, connected via Standard 9-pin Diagnostics port and cable. 
 
 Dark, digital-gauge dashboard and TSC1 throttle control for Cummins engines over SAE J1939. Works with the
 [Copperhill jCOM.J1939.USB gateway](https://copperhilltech.com/sae-j1939-starter-kit-and-network-simulator/)
