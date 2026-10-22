@@ -1,17 +1,50 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 """
-J1939 Engine Panel v2  -  Copperhill jCOM.J1939.USB  ->  Cummins CM850 / CM2850
-Dark digital dashboard + TSC1 throttle.  Pick port "DEMO" to try it without hardware.
+J1939 Engine Panel  -  dark digital dashboard + TSC1 throttle for Cummins engines over J1939.
+Adapters: Copperhill jCOM.J1939.USB (serial) or any RP1210 adapter (Cummins INLINE, etc.).
+Pick port "DEMO" to try it without hardware.
 
 Requires:  pip install pyserial        (Tkinter ships with Python)
 
-SAFETY: while ARMED the gateway repeats TSC1 every 10 ms on its own. If this PC or
-app dies, the engine HOLDS the last speed. Kill: STOP / Esc / Space, unplug the
-jCOM USB (board is USB powered), or key off.
+SAFETY: with the jCOM gateway, while ARMED the gateway repeats TSC1 every 10 ms on its own;
+if this PC or app dies, the engine HOLDS the last speed. Kill: STOP / Esc / Space,
+unplug the adapter, or key off.
 """
-import math, queue, random, threading, time, tkinter as tk
+import json, math, queue, random, sys, threading, time, tkinter as tk, urllib.request, webbrowser
 from tkinter import ttk, messagebox, font as tkfont
+
+__version__ = "1.0.0"
+APP_NAME = "J1939 Engine Panel"
+GITHUB_REPO = "UncleAndy123/j1939-engine-panel"
+
+
+def resource_path(rel):
+    """Path to a bundled file, both when run from source and from a PyInstaller exe."""
+    import os
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, rel)
+
+
+def _vtuple(v):
+    """'v1.2.10' -> (1, 2, 10); ignores any suffix like '-beta'."""
+    parts = []
+    for p in v.strip().lstrip("vV").split("-")[0].split("."):
+        try:
+            parts.append(int(p))
+        except ValueError:
+            parts.append(0)
+    return tuple(parts + [0] * (3 - len(parts)))
+
+
+def check_latest_release(timeout=8):
+    """Return (tag, html_url, notes) of the latest GitHub release, or raise."""
+    req = urllib.request.Request(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+                                 headers={"Accept": "application/vnd.github+json",
+                                          "User-Agent": f"{APP_NAME}/{__version__}"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:   # uses Windows proxy + cert store
+        data = json.load(r)
+    return data.get("tag_name", ""), data.get("html_url", ""), data.get("body", "") or ""
 
 try:
     import serial, serial.tools.list_ports
@@ -806,7 +839,16 @@ class App(tk.Tk):
         F.update(dig=pick(fams, "Bahnschrift SemiBold", "Bahnschrift", "DejaVu Sans Mono", "Consolas"),
                  ui=pick(fams, "Segoe UI", "Bahnschrift", "DejaVu Sans", "Helvetica"),
                  mono=pick(fams, "Cascadia Mono", "Consolas", "DejaVu Sans Mono", "Courier"))
-        self.title("J1939 Engine Panel")
+        self.title(f"{APP_NAME}  v{__version__}")
+        try:
+            if sys.platform == "win32":
+                self.iconbitmap(default=resource_path("assets/icon.ico"))
+            else:
+                self._icon_img = tk.PhotoImage(file=resource_path("assets/icon-256.png"))
+                self.iconphoto(True, self._icon_img)
+        except Exception:
+            pass
+        self.update_url = None
         self.configure(bg=BG)
         self.q, self.gw = queue.Queue(), None
         self.vals, self.stamp, self.dm1 = {}, {}, {}
@@ -824,6 +866,7 @@ class App(tk.Tk):
         for key, d in (("<Up>", 25), ("<Right>", 25), ("<Down>", -25), ("<Left>", -25)):
             self.bind_all(key, lambda e, d=d: self._nudge_key(e, d))
         self.after(20, self.poll)
+        self.after(2000, self.check_updates)              # silent check for a newer GitHub release
         self.after(100, self.refresh)
 
     # ------------------------------------------------------------ layout
@@ -868,7 +911,10 @@ class App(tk.Tk):
         self.p_gw = self._lbl(pills, "● GATEWAY  OFFLINE", bg=BG, fg=DIM)
         self.p_bus = self._lbl(pills, "● BUS  --", bg=BG, fg=DIM)
         self.p_mode = self._lbl(pills, "● MODE  --", bg=BG, fg=DIM)
-        for p in (self.p_gw, self.p_bus, self.p_mode):
+        self.p_ver = self._lbl(pills, f"v{__version__}", bg=BG, fg=DIM)
+        self.p_ver.config(cursor="hand2")
+        self.p_ver.bind("<Button-1>", lambda e: self.on_version_click())
+        for p in (self.p_gw, self.p_bus, self.p_mode, self.p_ver):
             p.pack(side="left", padx=(0, px(16)))
 
         ctl = tk.Frame(hdr, bg=BG)
@@ -1227,6 +1273,9 @@ class App(tk.Tk):
                 if kind == "log":
                     self.logmsg(m)
                     continue
+                if kind == "update":
+                    self._on_update_result(*m)
+                    continue
                 if kind == "disarm":
                     if self.armed or self.pending_arm:
                         self.stop(m)
@@ -1383,6 +1432,34 @@ class App(tk.Tk):
             self.dtc.delete("1.0", "end")
             self.dtc.insert("end", text)
             self.dtc.config(state="disabled")
+
+    # ------------------------------------------------------------ updates
+    def check_updates(self, manual=False):
+        def work():
+            try:
+                tag, url, _ = check_latest_release()
+                self.q.put(("update", (tag, url, manual), time.time()))
+            except Exception as e:
+                if manual:
+                    self.q.put(("log", f"Update check failed: {e}", time.time()))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_update_result(self, tag, url, manual):
+        if tag and _vtuple(tag) > _vtuple(__version__):
+            self.update_url = url
+            self.p_ver.config(text=f"⬆ UPDATE {tag} AVAILABLE — CLICK", fg=WARN)
+            self.logmsg(f"Update available: {tag} (you have v{__version__}). Click the version label to download.")
+        elif manual:
+            self.p_ver.config(text=f"v{__version__} · UP TO DATE", fg=OK)
+            self.logmsg(f"You have the latest version (v{__version__}).")
+            self.after(4000, lambda: self.p_ver.config(text=f"v{__version__}", fg=DIM))
+
+    def on_version_click(self):
+        if self.update_url:
+            webbrowser.open(self.update_url)
+        else:
+            self.p_ver.config(text=f"v{__version__} · CHECKING…", fg=MUTED)
+            self.check_updates(manual=True)
 
     def on_close(self):
         self.disconnect()

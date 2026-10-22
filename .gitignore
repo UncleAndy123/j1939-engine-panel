@@ -3,3 +3,7 @@ __pycache__/
 .venv/
 venv/
 *.log
+dist/
+*.spec
+version_info.txt
+build/*/

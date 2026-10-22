@@ -1,0 +1,64 @@
+name: Build & release
+
+# Push a tag like v1.0.0 to build the Windows exe and publish a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 32-bit Python: RP1210 adapter drivers (Cummins INLINE etc.) are 32-bit DLLs
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x86
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller pyserial
+
+      - name: Check tag matches __version__
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          APP=$(python build/make_version_info.py version_info.txt)
+          TAG="${GITHUB_REF_NAME#v}"
+          echo "app=$APP tag=$TAG"
+          [ "$APP" = "$TAG" ] || { echo "::error::Tag v$TAG does not match __version__ $APP"; exit 1; }
+
+      - name: Version resource
+        run: python build/make_version_info.py version_info.txt
+
+      - name: Import smoke test
+        run: python -c "import j1939_engine_panel as m; print(m.APP_NAME, m.__version__)"
+
+      - name: Build exe
+        run: >
+          pyinstaller --noconfirm --onefile --windowed
+          --name J1939EnginePanel
+          --icon assets/icon.ico
+          --add-data "assets;assets"
+          --version-file version_info.txt
+          j1939_engine_panel.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: J1939EnginePanel-exe
+          path: dist/J1939EnginePanel.exe
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/J1939EnginePanel.exe
+          body_path: CHANGELOG-latest.md
+          fail_on_unmatched_files: true

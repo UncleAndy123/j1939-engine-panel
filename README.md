@@ -44,7 +44,14 @@ Single Python file, Tkinter UI. `pyserial` is the only dependency (needed only f
 - **For the jCOM gateway:** Copperhill jCOM.J1939.USB board. USB chip is a SiLabs CP2102 — Windows 10 installs the driver automatically; on Windows 11, get it from [silabs.com](https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers).
 - **For an RP1210 adapter:** the adapter's driver installed (e.g. Cummins INLINE 8 drivers — the same ones INSITE uses). The RP1210 driver DLLs are 32-bit, so **run the app with 32-bit Python** on Windows. Close INSITE first; two programs can't share one adapter.
 
-## Install & run
+## Download (Windows)
+
+Get **`J1939EnginePanel.exe`** from the [latest release](https://github.com/UncleAndy123/j1939-engine-panel/releases/latest). It's a single file: no install, and no Python needed. It's built as 32-bit, so RP1210 adapters work out of the box.
+
+- Windows may show a SmartScreen warning because the exe isn't code-signed. Click **More info → Run anyway**.
+- The app checks GitHub for a newer release at startup. When one is available, the version label in the header turns yellow; click it to open the download page. Click the label at any other time to check manually.
+
+## Run from source
 
 ```bash
 pip install -r requirements.txt
@@ -108,6 +115,17 @@ Currently tested on:
 - **J1939 data:** decoded per SAE J1939-71.
   - Parameter groups: EEC1/2, ET1/2, EFL/P1, LFE, IC1, VEP1, HOURS, LFC, WFI.
   - Fault codes: DM1 (J1939-73).
+
+## Releasing a new version
+
+1. Bump `__version__` in `j1939_engine_panel.py` (for example `1.0.1`).
+2. Write the release notes in `CHANGELOG-latest.md`.
+3. Commit, then tag and push:
+   ```bash
+   git tag v1.0.1
+   git push origin main v1.0.1
+   ```
+4. GitHub Actions ([`release.yml`](.github/workflows/release.yml)) builds the exe with 32-bit Python and PyInstaller, then publishes the release with the exe attached. The build fails if the tag doesn't match `__version__`.
 
 ## License
 
