@@ -1,8 +1,13 @@
 name: Build & release
 
-# Push a tag like v1.0.0 to build the Windows exe and publish a GitHub release.
+# Releases are driven by __version__ in j1939_engine_panel.py:
+#   - Push to main with a new __version__  -> build the exe and publish release vX.Y.Z (tag created automatically)
+#   - Push to main with an unchanged version -> nothing to do
+#   - Push a tag vX.Y.Z (must match __version__) -> build and publish that release
+#   - Run manually (Actions tab)             -> build; publish if that version isn't released yet
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -10,7 +15,34 @@ permissions:
   contents: write
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      release: ${{ steps.v.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # need tags to see what's already released
+      - id: v
+        shell: bash
+        run: |
+          VER=$(sed -nE 's/^__version__ = "([^"]+)".*/\1/p' j1939_engine_panel.py)
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            [ "${GITHUB_REF_NAME#v}" = "$VER" ] || { echo "::error::Tag $GITHUB_REF_NAME does not match __version__ $VER"; exit 1; }
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          elif git rev-parse -q --verify "refs/tags/v$VER" >/dev/null; then
+            echo "v$VER is already released - nothing to publish."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New version v$VER - will build and publish."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build-windows:
+    needs: check
+    if: needs.check.outputs.release == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,15 +57,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pyinstaller pyserial
-
-      - name: Check tag matches __version__
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: bash
-        run: |
-          APP=$(python build/make_version_info.py version_info.txt)
-          TAG="${GITHUB_REF_NAME#v}"
-          echo "app=$APP tag=$TAG"
-          [ "$APP" = "$TAG" ] || { echo "::error::Tag v$TAG does not match __version__ $APP"; exit 1; }
 
       - name: Version resource
         run: python build/make_version_info.py version_info.txt
@@ -52,13 +75,16 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: J1939EnginePanel-exe
+          name: J1939EnginePanel-v${{ needs.check.outputs.version }}
           path: dist/J1939EnginePanel.exe
 
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: needs.check.outputs.release == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/J1939EnginePanel.exe
+          tag_name: v${{ needs.check.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: J1939 Engine Panel v${{ needs.check.outputs.version }}
           body_path: CHANGELOG-latest.md
+          files: dist/J1939EnginePanel.exe
           fail_on_unmatched_files: true

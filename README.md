@@ -120,12 +120,9 @@ Currently tested on:
 
 1. Bump `__version__` in `j1939_engine_panel.py` (for example `1.0.1`).
 2. Write the release notes in `CHANGELOG-latest.md`.
-3. Commit, then tag and push:
-   ```bash
-   git tag v1.0.1
-   git push origin main v1.0.1
-   ```
-4. GitHub Actions ([`release.yml`](.github/workflows/release.yml)) builds the exe with 32-bit Python and PyInstaller, then publishes the release with the exe attached. The build fails if the tag doesn't match `__version__`.
+3. Commit and push to `main`.
+
+That's it. GitHub Actions ([`release.yml`](.github/workflows/release.yml)) sees the new version, builds the exe with 32-bit Python and PyInstaller, creates the `v1.0.1` tag, and publishes the release with the exe attached. Pushes that don't change the version don't publish anything. You can also push a `vX.Y.Z` tag yourself; it must match `__version__`.
 
 ## License
 
