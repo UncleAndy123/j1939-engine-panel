@@ -12,6 +12,7 @@ if this PC or app dies, the engine HOLDS the last speed. Kill: STOP / Esc / Spac
 unplug the adapter, or key off.
 """
 import json, math, queue, random, sys, threading, time, tkinter as tk, urllib.request, webbrowser
+from array import array
 from tkinter import ttk, messagebox, font as tkfont
 
 __version__ = "1.0.1"
@@ -622,6 +623,119 @@ def le32(v):
     return [v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF]
 
 
+# =============================================================== engine sound (DEMO)
+class EngineSound:
+    """Real-time synthesized inline-6 diesel sound that follows RPM and load.
+
+    Layers: firing pulses at rpm/20 Hz (6 cyl, 4-stroke), per-cylinder variation,
+    combustion clatter that grows with load, crank lope at rpm/60 Hz and a faint turbo whine.
+    Needs the optional 'sounddevice' package; without it the app simply runs silent.
+    """
+    SR, BLOCK, TBL = 22050, 1024, 2048
+
+    def __init__(self):
+        self.rpm_t = self.load_t = 0.0                   # targets set from the UI
+        self.rpm = self.load = self.gain = 0.0           # smoothed values used by the synth
+        self.ph_fire = self.ph_crank = self.ph_turbo = 0.0
+        self.cyl, self.ev_amp, self.noise_lp = 0, 1.0, 0.0
+        self.stream, self.error = None, None
+        t = self.TBL
+        harm = ((1.0, 0.0), (0.62, 0.9), (0.42, 2.1), (0.28, 0.4), (0.18, 1.7), (0.11, 2.9))
+        fire = []
+        for i in range(t):
+            p = i / t
+            v = sum(a * math.sin(2 * math.pi * k * p + ph) for k, (a, ph) in enumerate(harm, 1))
+            fire.append(v * (0.35 + 0.65 * math.exp(-3.2 * p)))   # sharp attack, decaying body
+        peak = max(abs(v) for v in fire)
+        self.FIRE = [v / peak for v in fire]
+        self.SIN = [math.sin(2 * math.pi * i / t) for i in range(t)]
+        self.DECAY = [math.exp(-22 * i / t) for i in range(t)]   # clatter burst at each firing
+        self.CYL = (1.00, 0.91, 1.06, 0.95, 1.03, 0.88)         # slight cylinder-to-cylinder spread
+
+    @staticmethod
+    def available():
+        try:
+            import sounddevice  # noqa: F401
+            return True
+        except Exception:
+            return False
+
+    def set_target(self, rpm, load):
+        self.rpm_t = max(0.0, float(rpm or 0))
+        self.load_t = max(0.0, min(100.0, float(load or 0))) / 100.0
+
+    def render(self, n):
+        """Return n mono int16 samples as bytes."""
+        sr, t = self.SR, self.TBL
+        FIRE, SIN, DECAY, CYL = self.FIRE, self.SIN, self.DECAY, self.CYL
+        rnd = random.random
+        # smooth targets once per block; interpolate inside the block
+        r0, l0, g0 = self.rpm, self.load, self.gain
+        r1 = r0 + (self.rpm_t - r0) * 0.35
+        l1 = l0 + (self.load_t - l0) * 0.25
+        g1 = g0 + ((min(1.0, r1 / 450.0) if r1 > 120 else 0.0) - g0) * 0.3
+        self.rpm, self.load, self.gain = r1, l1, g1
+        ph_f, ph_c, ph_t = self.ph_fire, self.ph_crank, self.ph_turbo
+        cyl, ev_amp, nlp = self.cyl, self.ev_amp, self.noise_lp
+        out = array("h", bytes(2 * n))
+        inv = 1.0 / n
+        for i in range(n):
+            f = i * inv
+            rpm = r0 + (r1 - r0) * f
+            load = l0 + (l1 - l0) * f
+            gain = g0 + (g1 - g0) * f
+            if gain <= 0.0005:
+                continue
+            ph_f += rpm / 20.0 / sr
+            if ph_f >= 1.0:                              # next cylinder fires
+                ph_f -= 1.0
+                cyl = (cyl + 1) % 6
+                ev_amp = CYL[cyl] * (0.9 + 0.2 * rnd())
+            ph_c = (ph_c + rpm / 60.0 / sr) % 1.0
+            ph_t = (ph_t + (1800.0 + 2.2 * rpm * (0.5 + load)) / sr) % 1.0
+            k = int(ph_f * t)
+            nlp += (rnd() * 2.0 - 1.0 - nlp) * (0.25 + 0.45 * load)   # brighter clatter under load
+            s = (FIRE[k] * ev_amp * (0.55 + 0.45 * load)
+                 + DECAY[k] * nlp * (0.35 + 0.9 * load)
+                 + SIN[int(ph_c * t)] * 0.10
+                 + SIN[int(ph_t * t)] * 0.035 * load * min(1.0, rpm / 1800.0))
+            s *= gain * 0.7
+            s = s / (1.0 + abs(s))                       # soft clip
+            out[i] = int(s * 30000)
+        self.ph_fire, self.ph_crank, self.ph_turbo = ph_f, ph_c, ph_t
+        self.cyl, self.ev_amp, self.noise_lp = cyl, ev_amp, nlp
+        return out.tobytes()
+
+    def _callback(self, outdata, frames, time_info, status):
+        try:
+            outdata[:] = self.render(frames)
+        except Exception:
+            outdata[:] = bytes(len(outdata))
+
+    def start(self):
+        if self.stream:
+            return True
+        try:
+            import sounddevice as sd
+            self.stream = sd.RawOutputStream(samplerate=self.SR, blocksize=self.BLOCK, channels=1,
+                                             dtype="int16", latency="high", callback=self._callback)
+            self.stream.start()
+            return True
+        except Exception as e:
+            self.stream, self.error = None, str(e)
+            return False
+
+    def stop(self):
+        if self.stream:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception:
+                pass
+            self.stream = None
+        self.rpm = self.load = self.gain = 0.0
+
+
 # =============================================================== theme
 BG, PANEL, PANEL2, BORDER = "#0a0e13", "#111821", "#17202b", "#223042"
 TEXT, MUTED, DIM = "#e6edf3", "#7d8b9c", "#3a4656"
@@ -849,6 +963,10 @@ class App(tk.Tk):
         except Exception:
             pass
         self.update_url = None
+        self.snd = EngineSound()
+        self.sound_ok = EngineSound.available()
+        self.sound_on = self.sound_ok
+        self._snd_warned = False
         self.configure(bg=BG)
         self.q, self.gw = queue.Queue(), None
         self.vals, self.stamp, self.dm1 = {}, {}, {}
@@ -934,8 +1052,11 @@ class App(tk.Tk):
         self.can = ttk.Combobox(ctl, width=4, values=["250", "500"], font=(F["ui"], 10))
         self.can.set("250")
         self.can.pack(side="left")
+        self.btn_sound = mkbtn(ctl, "", self.toggle_sound)
+        self.btn_sound.pack(side="left", padx=(px(12), 0))
+        self._sound_label()
         self.btn_conn = mkbtn(ctl, "CONNECT", self.toggle_conn, bg=ACCENT, fg=BG)
-        self.btn_conn.pack(side="left", padx=(px(12), 0))
+        self.btn_conn.pack(side="left", padx=(px(8), 0))
 
         # ---- body
         body = tk.Frame(self, bg=BG)
@@ -1400,6 +1521,15 @@ class App(tk.Tk):
             except Exception:
                 pass
 
+        # engine sound: DEMO only, follows the displayed RPM and load
+        if self.sound_on and isinstance(self.gw, DemoGateway):
+            if not self.snd.stream and not self.snd.start() and not self._snd_warned:
+                self._snd_warned = True
+                self.logmsg(f"Sound unavailable: {self.snd.error}")
+            self.snd.set_target(rpm or 0, val("load") or 0)
+        elif self.snd.stream:
+            self.snd.stop()
+
         # safety watchdogs
         if self.armed:
             _, hi = self._limits()
@@ -1461,7 +1591,26 @@ class App(tk.Tk):
             self.p_ver.config(text=f"v{__version__} · CHECKING…", fg=MUTED)
             self.check_updates(manual=True)
 
+    # ------------------------------------------------------------ sound
+    def _sound_label(self):
+        if not self.sound_ok:
+            self.btn_sound.config(text="🔇 SOUND N/A", fg=DIM)
+        elif self.sound_on:
+            self.btn_sound.config(text="🔊 SOUND", fg=ACCENT)
+        else:
+            self.btn_sound.config(text="🔇 SOUND", fg=MUTED)
+
+    def toggle_sound(self):
+        if not self.sound_ok:
+            self.logmsg("Engine sound needs the 'sounddevice' package:  pip install sounddevice")
+            return
+        self.sound_on = not self.sound_on
+        self._sound_label()
+        if not isinstance(self.gw, DemoGateway):
+            self.logmsg("Engine sound plays in DEMO mode.")
+
     def on_close(self):
+        self.snd.stop()
         self.disconnect()
         self.destroy()
 

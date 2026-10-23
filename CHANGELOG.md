@@ -6,6 +6,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+- **Engine sound in DEMO mode:** a real-time synthesized inline-6 diesel sound that follows the displayed RPM and load. It has firing pulses at the true firing frequency, combustion clatter that grows with load, crank lope and a faint turbo whine.
+  - Toggle it with the **SOUND** button in the header.
+  - It needs the optional `sounddevice` package. The Windows exe includes it; without it, the app runs silently.
+
+## [1.0.1] - 2026-10-22
+
 ### Changed
 - Release notes moved into this changelog. `CHANGELOG-latest.md` holds only the notes for the next release.
 
@@ -48,5 +55,6 @@ These were found during development, before the release:
 - Readings are timestamped when they arrive, so dragging the window on Windows no longer trips a false "lost engine RPM data" stop.
 - The PORT drop-down widens to show full adapter names.
 
-[Unreleased]: https://github.com/UncleAndy123/j1939-engine-panel/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/UncleAndy123/j1939-engine-panel/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/UncleAndy123/j1939-engine-panel/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/UncleAndy123/j1939-engine-panel/releases/tag/v1.0.0

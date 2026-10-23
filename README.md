@@ -35,7 +35,7 @@ Single Python file, Tkinter UI. `pyserial` is the only dependency (needed only f
 - **Two adapter backends**
   - **jCOM.J1939.USB** serial gateway — cross-platform.
   - **RP1210** — Cummins INLINE 6/7/8, Nexiq, and other RP1210 adapters (Windows only). Detected automatically from the installed drivers and listed in the port menu.
-- **DEMO mode**: a simulated gateway and engine, so the UI can be tried without hardware.
+- **DEMO mode**: a simulated gateway and engine, so the UI can be tried without hardware. It includes a live **engine sound** that follows RPM and load; toggle it with the **SOUND** button. It needs the optional `sounddevice` package, which the exe includes.
 
 ## Requirements
 

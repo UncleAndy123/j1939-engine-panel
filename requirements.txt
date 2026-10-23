@@ -1,1 +1,2 @@
 pyserial>=3.5
+sounddevice>=0.4.6   # optional: engine sound in DEMO mode

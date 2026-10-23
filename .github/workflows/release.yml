@@ -56,13 +56,16 @@ jobs:
       - name: Install build tools
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller pyserial
+          pip install pyinstaller pyserial sounddevice
 
       - name: Version resource
         run: python build/make_version_info.py version_info.txt
 
       - name: Import smoke test
         run: python -c "import j1939_engine_panel as m; print(m.APP_NAME, m.__version__)"
+
+      - name: Audio library check (bundled 32-bit PortAudio)
+        run: python -c "import sounddevice as sd; print(sd.get_portaudio_version())"
 
       - name: Build exe
         run: >
