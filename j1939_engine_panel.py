@@ -625,100 +625,248 @@ def le32(v):
 
 # =============================================================== engine sound (DEMO)
 class EngineSound:
-    """Real-time synthesized inline-6 diesel sound that follows RPM and load.
+    """Real-time inline-6 diesel sound for DEMO mode, driven by RPM and load.
 
-    Layers: firing pulses at rpm/20 Hz (6 cyl, 4-stroke), per-cylinder variation,
-    combustion clatter that grows with load, crank lope at rpm/60 Hz and a faint turbo whine.
-    Needs the optional 'sounddevice' package; without it the app simply runs silent.
+    Physically inspired, block-based (numpy):
+      * Every cylinder firing triggers a combustion "grain": a pressure pulse, a combustion
+        noise burst and an injector knock, rung through a modal model of the engine block,
+        manifold and exhaust (14+ decaying resonances). Grains overlap and add, like the real
+        structure ringing from successive firings.
+      * Each of the 6 cylinders has its own resonance/amplitude/timing character, plus
+        event-to-event jitter, giving the uneven lope of a real engine.
+      * Light-load and heavy-load grain families are cross-faded by engine load: idle is
+        clattery, load is a deep roar.
+      * Continuous layers: gear-train whine, turbo whistle and air rush with spool-up lag,
+        and low intake/exhaust rumble.
+      * Stereo: left/right use slightly different structure models for width.
+    Needs the optional packages numpy + sounddevice; without them the app runs silent.
     """
-    SR, BLOCK, TBL = 22050, 1024, 2048
+    SR, BLOCK, GRAIN_S, VARIANTS = 44100, 2048, 0.30, 4
+    CYL_AMP = (1.00, 0.95, 1.04, 0.97, 1.02, 0.93)
+    CYL_DT = (0.0, 0.00025, -0.0002, 0.0003, -0.00015, 0.0001)    # firing timing spread (s)
 
     def __init__(self):
-        self.rpm_t = self.load_t = 0.0                   # targets set from the UI
-        self.rpm = self.load = self.gain = 0.0           # smoothed values used by the synth
-        self.ph_fire = self.ph_crank = self.ph_turbo = 0.0
-        self.cyl, self.ev_amp, self.noise_lp = 0, 1.0, 0.0
-        self.stream, self.error = None, None
-        t = self.TBL
-        harm = ((1.0, 0.0), (0.62, 0.9), (0.42, 2.1), (0.28, 0.4), (0.18, 1.7), (0.11, 2.9))
-        fire = []
-        for i in range(t):
-            p = i / t
-            v = sum(a * math.sin(2 * math.pi * k * p + ph) for k, (a, ph) in enumerate(harm, 1))
-            fire.append(v * (0.35 + 0.65 * math.exp(-3.2 * p)))   # sharp attack, decaying body
-        peak = max(abs(v) for v in fire)
-        self.FIRE = [v / peak for v in fire]
-        self.SIN = [math.sin(2 * math.pi * i / t) for i in range(t)]
-        self.DECAY = [math.exp(-22 * i / t) for i in range(t)]   # clatter burst at each firing
-        self.CYL = (1.00, 0.91, 1.06, 0.95, 1.03, 0.88)         # slight cylinder-to-cylinder spread
+        self.rpm_t = self.load_t = 0.0
+        self.rpm = self.load = self.gain = self.spool = 0.0
+        self.stream, self.error, self.ready = None, None, False
+        self.lock = threading.Lock()
 
     @staticmethod
     def available():
         try:
-            import sounddevice  # noqa: F401
+            import numpy, sounddevice  # noqa: F401
             return True
         except Exception:
             return False
 
+    # ---- one-time synthesis of the sound assets
+    def _build(self):
+        import numpy as np
+        self.np = np
+        sr, n = self.SR, int(self.GRAIN_S * self.SR)
+        rng = np.random.default_rng(1939)
+        t = np.arange(n) / sr
+
+        def bandnoise(length, lo, hi, seed_rng):
+            spec = np.fft.rfft(seed_rng.standard_normal(length))
+            f = np.fft.rfftfreq(length, 1 / sr)
+            spec *= np.exp(-0.5 * ((np.log(np.maximum(f, 1)) - np.log(np.sqrt(lo * hi))) /
+                                   (0.5 * np.log(hi / lo))) ** 2)
+            x = np.fft.irfft(spec, length)
+            return x / (np.abs(x).max() + 1e-9)
+
+        # Structure modes (Hz, decay s, weight): block, manifold, exhaust pipe, sheet metal
+        # low modes are well damped (no fixed-pitch drone); the low end comes from exhaust pulses
+        base_modes = [(52, .030, .35), (74, .028, .35), (105, .026, .40), (150, .024, .45), (210, .022, .5),
+                      (290, .030, .55), (380, .028, .55), (520, .024, .55), (700, .022, .55), (950, .020, .55),
+                      (1300, .018, .6), (1750, .015, .6), (2400, .012, .55), (3200, .009, .45),
+                      (4300, .007, .35), (5600, .005, .25)]
+
+        def structure_ir(r):
+            ir = np.zeros(n)
+            for f, d, w in base_modes:
+                f *= 1 + r.uniform(-.05, .05)
+                d *= 1 + r.uniform(-.2, .2)
+                ir += w * r.uniform(.7, 1.3) * np.exp(-t / d) * np.sin(2 * np.pi * f * t + r.uniform(0, 6.3))
+            return ir
+
+        def excitation(r, heavy):
+            e = np.zeros(n)
+            # combustion pressure pulse: fast rise, decay (longer and stronger under load)
+            rise, fall = (0.0012, 0.006) if heavy else (0.0007, 0.0035)
+            e += (1 - np.exp(-t / rise)) * np.exp(-t / fall) * (1.6 if heavy else 0.8)
+            # rough combustion noise burst
+            burst = r.standard_normal(n) * np.exp(-t / (0.007 if heavy else 0.004))
+            e += burst * (0.55 if heavy else 0.35)
+            # injector / combustion knock: very short, bright - the classic diesel clatter
+            k = np.exp(-t / 0.0006) * r.standard_normal(n)
+            e += k * (0.9 if heavy else 1.8)
+            return e
+
+        def grain(r, heavy):
+            # convolve excitation with the structure response (FFT convolution)
+            m = 2 * n
+            g = np.fft.irfft(np.fft.rfft(excitation(r, heavy), m) * np.fft.rfft(structure_ir(r), m), m)[:n]
+            g *= np.minimum(1, (n - np.arange(n)) / (0.02 * sr))    # fade tail to zero
+            return g - g.mean()
+
+        # grains[ch][family][cylinder][variant]
+        self.grains = []
+        for ch in range(2):
+            fam = []
+            for heavy in (False, True):
+                cyls = []
+                for c in range(6):
+                    cr = np.random.default_rng(100 * c + 7 * ch + (50 if heavy else 0))
+                    cyls.append([grain(np.random.default_rng(cr.integers(1 << 30)), heavy)
+                                 for _ in range(self.VARIANTS)])
+                fam.append(cyls)
+            self.grains.append(fam)
+        peak = max(np.abs(g).max() for ch in self.grains for f in ch for c in f for g in c)
+        for ch in self.grains:
+            for f in ch:
+                for c in f:
+                    for i in range(len(c)):
+                        c[i] = (c[i] / peak).astype(np.float32)
+        self.glen = n
+
+        # continuous texture loops (6 s, stereo-decorrelated)
+        L = 6 * sr
+        self.air = [bandnoise(L, 900, 7000, np.random.default_rng(11 + ch)).astype(np.float32) for ch in range(2)]
+        self.rumble = [bandnoise(L, 25, 160, np.random.default_rng(21 + ch)).astype(np.float32) for ch in range(2)]
+        self.turb = bandnoise(L, 60, 900, np.random.default_rng(31)).astype(np.float32)   # exhaust turbulence
+        # exhaust pipe reflections per channel: (delay s, gain)
+        self.pipe = [((0.0090, -0.45), (0.0180, 0.20)), ((0.0098, -0.42), (0.0196, 0.18))]
+        self.loop_pos = 0
+        self.loop_len = L
+
+        # runtime state
+        self.acc = np.zeros((2, self.BLOCK + n + 8), dtype=np.float32)
+        self.next_fire = 0.0              # samples until next firing, relative to block start
+        self.cyl = 0
+        self.ph_gear = self.ph_turbo = 0.0
+        self.rng = np.random.default_rng()
+        self.ready = True
+
+    # ---- control
     def set_target(self, rpm, load):
         self.rpm_t = max(0.0, float(rpm or 0))
         self.load_t = max(0.0, min(100.0, float(load or 0))) / 100.0
 
-    def render(self, n):
-        """Return n mono int16 samples as bytes."""
-        sr, t = self.SR, self.TBL
-        FIRE, SIN, DECAY, CYL = self.FIRE, self.SIN, self.DECAY, self.CYL
-        rnd = random.random
-        # smooth targets once per block; interpolate inside the block
-        r0, l0, g0 = self.rpm, self.load, self.gain
-        r1 = r0 + (self.rpm_t - r0) * 0.35
-        l1 = l0 + (self.load_t - l0) * 0.25
-        g1 = g0 + ((min(1.0, r1 / 450.0) if r1 > 120 else 0.0) - g0) * 0.3
-        self.rpm, self.load, self.gain = r1, l1, g1
-        ph_f, ph_c, ph_t = self.ph_fire, self.ph_crank, self.ph_turbo
-        cyl, ev_amp, nlp = self.cyl, self.ev_amp, self.noise_lp
-        out = array("h", bytes(2 * n))
-        inv = 1.0 / n
-        for i in range(n):
-            f = i * inv
-            rpm = r0 + (r1 - r0) * f
-            load = l0 + (l1 - l0) * f
-            gain = g0 + (g1 - g0) * f
-            if gain <= 0.0005:
-                continue
-            ph_f += rpm / 20.0 / sr
-            if ph_f >= 1.0:                              # next cylinder fires
-                ph_f -= 1.0
-                cyl = (cyl + 1) % 6
-                ev_amp = CYL[cyl] * (0.9 + 0.2 * rnd())
-            ph_c = (ph_c + rpm / 60.0 / sr) % 1.0
-            ph_t = (ph_t + (1800.0 + 2.2 * rpm * (0.5 + load)) / sr) % 1.0
-            k = int(ph_f * t)
-            nlp += (rnd() * 2.0 - 1.0 - nlp) * (0.25 + 0.45 * load)   # brighter clatter under load
-            s = (FIRE[k] * ev_amp * (0.55 + 0.45 * load)
-                 + DECAY[k] * nlp * (0.35 + 0.9 * load)
-                 + SIN[int(ph_c * t)] * 0.10
-                 + SIN[int(ph_t * t)] * 0.035 * load * min(1.0, rpm / 1800.0))
-            s *= gain * 0.7
-            s = s / (1.0 + abs(s))                       # soft clip
-            out[i] = int(s * 30000)
-        self.ph_fire, self.ph_crank, self.ph_turbo = ph_f, ph_c, ph_t
-        self.cyl, self.ev_amp, self.noise_lp = cyl, ev_amp, nlp
-        return out.tobytes()
+    def render(self, frames):
+        """Return a (frames, 2) float32 stereo block."""
+        np = self.np
+        sr, n = self.SR, frames
+        r0, l0, g0, s0 = self.rpm, self.load, self.gain, self.spool
+        r1 = r0 + (self.rpm_t - r0) * 0.30
+        l1 = l0 + (self.load_t - l0) * 0.20
+        g1 = g0 + ((min(1.0, r1 / 500.0) if r1 > 150 else 0.0) - g0) * 0.25
+        boost_target = min(1.0, max(0.0, (r1 - 650) / 1250.0)) * (0.35 + 0.65 * l1)
+        s1 = s0 + (boost_target - s0) * (0.06 if boost_target > s0 else 0.10)  # turbo spool lag
+        self.rpm, self.load, self.gain, self.spool = r1, l1, g1, s1
+
+        if self.acc.shape[1] < n + self.glen:              # driver asked for a bigger block
+            self.acc = np.concatenate([self.acc, np.zeros((2, n + self.glen - self.acc.shape[1]),
+                                                          dtype=np.float32)], axis=1)
+        acc, glen = self.acc, self.glen
+        rng = self.rng
+        # --- schedule combustion events in this block
+        if r1 > 150 or r0 > 150:
+            pos = self.next_fire
+            while pos < n:
+                f = max(0.0, pos) / n
+                rpm = r0 + (r1 - r0) * f
+                load = l0 + (l1 - l0) * f
+                if rpm < 120:
+                    pos += sr * 0.05
+                    continue
+                c = self.cyl
+                at = min(n - 1, max(0, int(pos + self.CYL_DT[c] * sr)))
+                amp = self.CYL_AMP[c] * rng.uniform(0.94, 1.06) * (0.55 + 0.9 * load)
+                v = int(rng.integers(self.VARIANTS))
+                for ch in range(2):
+                    g = self.grains[ch][0][c][v] * (1 - load) + self.grains[ch][1][c][v] * load
+                    acc[ch, at:at + glen] += amp * g
+                # exhaust blowdown pulse: lasts ~80 crank degrees, so its length and pitch follow rpm
+                D = min(0.03, (80.0 / 360.0) * (60.0 / rpm))
+                m = min(int(4 * D * sr), acc.shape[1] - at)
+                x = np.arange(m, dtype=np.float32) / (D * sr / 2.5)
+                pulse = (x * x * np.exp(-x)) / 0.541                           # peak 1.0
+                tp = (self.loop_pos + at + np.arange(m)) % self.loop_len
+                pulse *= 1 + 0.25 * self.turb[tp]                               # turbulence
+                pulse -= pulse.mean() * 0.6                                     # mostly AC
+                ex_amp = self.CYL_AMP[c] * (0.55 + 0.75 * load) * rng.uniform(0.96, 1.04)
+                for ch in range(2):
+                    acc[ch, at:at + m] += ex_amp * pulse
+                    for dly, rg in self.pipe[ch]:
+                        o = at + int(dly * sr)
+                        acc[ch, o:o + m] += ex_amp * rg * pulse[:max(0, min(m, acc.shape[1] - o))]
+                self.cyl = (c + 1) % 6
+                interval = sr * 20.0 / rpm                          # inline-6, 4-stroke: rpm/20 Hz
+                pos += interval * (1 + rng.uniform(-0.006, 0.006))
+            self.next_fire = pos - n
+        else:
+            self.next_fire = 0.0
+
+        out = acc[:, :n].copy()
+        acc[:, :-n] = acc[:, n:]
+        acc[:, -n:] = 0
+
+        # --- continuous layers
+        ramp = np.linspace(0, 1, n, endpoint=False, dtype=np.float32)
+        rpm_v = r0 + (r1 - r0) * ramp
+        load_v = l0 + (l1 - l0) * ramp
+        spool_v = s0 + (s1 - s0) * ramp
+        gain_v = g0 + (g1 - g0) * ramp
+        # gear-train whine: 37-tooth gear mesh, faint, with a little wobble
+        f_gear = rpm_v / 60.0 * 37
+        ph = self.ph_gear + np.cumsum(f_gear) / sr
+        self.ph_gear = float(ph[-1] % 1.0)
+        gear = (np.sin(2 * np.pi * ph) + 0.3 * np.sin(4 * np.pi * ph)) * (0.010 + 0.012 * load_v)
+        # turbo whistle with spool lag + slight flutter
+        f_t = 2600 + 9000 * spool_v
+        ph = self.ph_turbo + np.cumsum(f_t * (1 + 0.004 * np.sin(2 * np.pi * 7 * ramp))) / sr
+        self.ph_turbo = float(ph[-1] % 1.0)
+        whistle = np.sin(2 * np.pi * ph) * (0.05 * spool_v ** 2)
+        # air rush and low rumble loops
+        p = self.loop_pos
+        idx = (p + np.arange(n)) % self.loop_len
+        self.loop_pos = (p + n) % self.loop_len
+        for ch in range(2):
+            air = self.air[ch][idx] * (0.012 + 0.10 * spool_v)
+            rum = self.rumble[ch][idx] * (0.015 + 0.06 * load_v) * np.minimum(1, rpm_v / 900)
+            out[ch] += (gear * (1.0 if ch == 0 else 0.85) + whistle + air + rum)
+
+        out *= gain_v * 0.55
+        out = np.tanh(out)                                         # gentle saturation
+        return out.T.astype(np.float32)
 
     def _callback(self, outdata, frames, time_info, status):
         try:
-            outdata[:] = self.render(frames)
+            with self.lock:
+                outdata[:] = self.render(frames)
         except Exception:
-            outdata[:] = bytes(len(outdata))
+            outdata.fill(0)
 
     def start(self):
+        """Start playback. Returns False while assets are still being built (call again later)."""
         if self.stream:
             return True
+        if not self.ready:
+            if not getattr(self, "_building", False):
+                self._building = True
+
+                def build():
+                    try:
+                        self._build()
+                    except Exception as e:
+                        self.error = f"sound init failed: {e}"
+                threading.Thread(target=build, daemon=True).start()
+            return False
         try:
             import sounddevice as sd
-            self.stream = sd.RawOutputStream(samplerate=self.SR, blocksize=self.BLOCK, channels=1,
-                                             dtype="int16", latency="high", callback=self._callback)
+            self.stream = sd.OutputStream(samplerate=self.SR, blocksize=self.BLOCK, channels=2,
+                                          dtype="float32", latency="high", callback=self._callback)
             self.stream.start()
             return True
         except Exception as e:
@@ -733,7 +881,10 @@ class EngineSound:
             except Exception:
                 pass
             self.stream = None
-        self.rpm = self.load = self.gain = 0.0
+        self.rpm = self.load = self.gain = self.spool = 0.0
+        if self.ready:
+            self.acc[:] = 0
+            self.next_fire = 0.0
 
 
 # =============================================================== theme
@@ -1052,11 +1203,10 @@ class App(tk.Tk):
         self.can = ttk.Combobox(ctl, width=4, values=["250", "500"], font=(F["ui"], 10))
         self.can.set("250")
         self.can.pack(side="left")
-        self.btn_sound = mkbtn(ctl, "", self.toggle_sound)
-        self.btn_sound.pack(side="left", padx=(px(12), 0))
+        self.btn_sound = mkbtn(ctl, "", self.toggle_sound)    # shown only while DEMO is connected
         self._sound_label()
         self.btn_conn = mkbtn(ctl, "CONNECT", self.toggle_conn, bg=ACCENT, fg=BG)
-        self.btn_conn.pack(side="left", padx=(px(8), 0))
+        self.btn_conn.pack(side="left", padx=(px(12), 0))
 
         # ---- body
         body = tk.Frame(self, bg=BG)
@@ -1271,6 +1421,8 @@ class App(tk.Tk):
         self.after(5000, self.diag_report)
         self.btn_conn.config(text="DISCONNECT")
         self.btn_conn.recolor(PANEL2, TEXT)
+        if isinstance(self.gw, DemoGateway):
+            self.btn_sound.pack(side="left", padx=(px(12), 0), before=self.btn_conn)
         self.logmsg(f"Opened {port} - reset @ {self.can.get()} kbps, listen-only")
 
     def add_filters(self):
@@ -1296,6 +1448,8 @@ class App(tk.Tk):
         self.gw, self.claimed, self.sa = None, False, None
         self.btn_conn.config(text="CONNECT")
         self.btn_conn.recolor(ACCENT, BG)
+        self.btn_sound.pack_forget()
+        self.snd.stop()
 
     # ------------------------------------------------------------ throttle
     def _claim(self, sa):
@@ -1523,7 +1677,8 @@ class App(tk.Tk):
 
         # engine sound: DEMO only, follows the displayed RPM and load
         if self.sound_on and isinstance(self.gw, DemoGateway):
-            if not self.snd.stream and not self.snd.start() and not self._snd_warned:
+            if (not self.snd.stream and not self.snd.start() and self.snd.error
+                    and not self._snd_warned):
                 self._snd_warned = True
                 self.logmsg(f"Sound unavailable: {self.snd.error}")
             self.snd.set_target(rpm or 0, val("load") or 0)
@@ -1602,12 +1757,10 @@ class App(tk.Tk):
 
     def toggle_sound(self):
         if not self.sound_ok:
-            self.logmsg("Engine sound needs the 'sounddevice' package:  pip install sounddevice")
+            self.logmsg("Engine sound needs the 'numpy' and 'sounddevice' packages:  pip install numpy sounddevice")
             return
         self.sound_on = not self.sound_on
         self._sound_label()
-        if not isinstance(self.gw, DemoGateway):
-            self.logmsg("Engine sound plays in DEMO mode.")
 
     def on_close(self):
         self.snd.stop()

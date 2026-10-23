@@ -7,9 +7,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ## [Unreleased]
 
 ### Added
-- **Engine sound in DEMO mode:** a real-time synthesized inline-6 diesel sound that follows the displayed RPM and load. It has firing pulses at the true firing frequency, combustion clatter that grows with load, crank lope and a faint turbo whine.
-  - Toggle it with the **SOUND** button in the header.
-  - It needs the optional `sounddevice` package. The Windows exe includes it; without it, the app runs silently.
+- **Engine sound in DEMO mode:** a real-time inline-6 diesel sound that follows the displayed RPM and load.
+  - Each cylinder firing rings a modeled engine structure (block, manifold, exhaust) with an exhaust pulse whose length and pitch follow RPM, so the engine note tracks speed naturally.
+  - Load shifts it from idle clatter to a deep roar under load. Each cylinder has its own character and small timing variations, giving a natural lope.
+  - Gear-train whine, a turbo whistle and air rush with spool-up lag, and stereo width.
+  - A **SOUND** button appears in the header only while DEMO is connected.
+  - It needs the optional `numpy` and `sounddevice` packages. The Windows exe includes them; without them, the app runs silently.
 
 ## [1.0.1] - 2026-10-22
 
